@@ -33,6 +33,11 @@ export class MarketDataController {
     return this.marketDataService.findAll(query);
   }
 
+  @Get(':symbol/ytd-performance')
+  getYtdPerformance(@Param('symbol') symbol: string) {
+    return this.marketDataService.getYtdPerformance(symbol);
+  }
+
   @Get(':id')
   findOne(@Param('id') id: string) {
     return this.marketDataService.findOne(id);

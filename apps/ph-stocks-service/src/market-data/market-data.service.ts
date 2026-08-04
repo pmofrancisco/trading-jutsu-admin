@@ -24,6 +24,15 @@ function isUniqueViolation(error: unknown): boolean {
   return driverError?.code === POSTGRES_UNIQUE_VIOLATION;
 }
 
+export interface YtdPerformance {
+  symbol: string;
+  from: Date;
+  to: Date;
+  startClose: number;
+  endClose: number;
+  changePct: number;
+}
+
 @Injectable()
 export class MarketDataService {
   constructor(
@@ -53,6 +62,42 @@ export class MarketDataService {
       .take(query.limit ?? 100)
       .skip(query.offset ?? 0)
       .getMany();
+  }
+
+  async getYtdPerformance(
+    symbol: string,
+    asOf: Date = new Date(),
+  ): Promise<YtdPerformance> {
+    const yearStart = new Date(Date.UTC(asOf.getUTCFullYear(), 0, 1));
+
+    const baseline = await this.marketDataRepository
+      .createQueryBuilder('marketData')
+      .where('marketData.symbol = :symbol', { symbol })
+      .andWhere('marketData.timestamp < :yearStart', { yearStart })
+      .orderBy('marketData.timestamp', 'DESC')
+      .limit(1)
+      .getOne();
+
+    const latest = await this.marketDataRepository
+      .createQueryBuilder('marketData')
+      .where('marketData.symbol = :symbol', { symbol })
+      .andWhere('marketData.timestamp <= :asOf', { asOf })
+      .orderBy('marketData.timestamp', 'DESC')
+      .limit(1)
+      .getOne();
+
+    if (!baseline || !latest) {
+      throw new NotFoundException(`No market data for symbol "${symbol}"`);
+    }
+
+    return {
+      symbol,
+      from: baseline.timestamp,
+      to: latest.timestamp,
+      startClose: baseline.close,
+      endClose: latest.close,
+      changePct: ((latest.close - baseline.close) / baseline.close) * 100,
+    };
   }
 
   async findOne(id: string): Promise<MarketData> {
