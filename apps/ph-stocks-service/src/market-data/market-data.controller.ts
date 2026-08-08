@@ -8,7 +8,7 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { ApiOperation, ApiParam, ApiTags } from '@nestjs/swagger';
+import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { MarketDataService } from './market-data.service';
 import { CreateMarketDataDto } from './dto/create-market-data.dto';
 import { UpdateMarketDataDto } from './dto/update-market-data.dto';
@@ -45,13 +45,6 @@ export class MarketDataController {
   @Get()
   findAll(@Query() query: QueryMarketDataDto) {
     return this.marketDataService.findAll(query);
-  }
-
-  @ApiOperation({ summary: 'Get year-to-date performance for a symbol' })
-  @ApiParam({ name: 'symbol', example: 'JFC' })
-  @Get(':symbol/ytd-performance')
-  getYtdPerformance(@Param('symbol') symbol: string) {
-    return this.marketDataService.getYtdPerformance(symbol);
   }
 
   @ApiOperation({ summary: 'Get a market-data candle by id' })
