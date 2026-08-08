@@ -8,9 +8,13 @@ export interface PseEodRow {
   value: number | null;
 }
 
-// PSE's Daily Quotation Report switches to USD-denominated prices past this
-// section; stop parsing there to avoid mixing currencies into PHP fields.
+// PSE's Daily Quotation Report has a "Dollar Denominated Securities"
+// sub-section (bracketed by this marker and its own "DDS TOTAL" line) with
+// USD-denominated prices; skip just that sub-section to avoid mixing
+// currencies into PHP fields. The Sectoral Summary table (with PHP values)
+// follows later in the same report, so parsing must continue past it.
 const DOLLAR_SECTION_MARKER = 'DOLLARDENOMINATEDSECURITIES';
+const DOLLAR_SECTION_END_PREFIX = 'DDS TOTAL';
 
 const NUMBER_OR_DASH = String.raw`-|\(?[\d,]+(?:\.\d+)?\)?`;
 
@@ -19,6 +23,37 @@ const NUMBER_OR_DASH = String.raw`-|\(?[\d,]+(?:\.\d+)?\)?`;
 const ROW_REGEX = new RegExp(
   `^.+?\\s+([A-Z][A-Z0-9]{0,19})` +
     Array.from({ length: 9 }, () => `\\s+(${NUMBER_OR_DASH})`).join('') +
+    '$',
+);
+
+// The report's "SECTORAL SUMMARY" table uses these exact labels; map each to
+// the symbol its candle should be stored under.
+const SECTOR_SYMBOLS: Record<string, string> = {
+  Financials: 'FINA',
+  Industrial: 'INDU',
+  'Holding Firms': 'HOLD',
+  Property: 'PROP',
+  Services: 'SERV',
+  'Mining & Oil': 'MINI',
+};
+
+const SECTOR_NAME_PATTERN = Object.keys(SECTOR_SYMBOLS)
+  .map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  .join('|');
+
+// A sectoral row looks like:
+// "<Sector Name> <Open> <High> <Low> <Close> <%Change> <Pt.Change> <Volume> <Value>"
+const SECTOR_ROW_REGEX = new RegExp(
+  `^(${SECTOR_NAME_PATTERN})` +
+    Array.from({ length: 6 }, () => `\\s+(${NUMBER_OR_DASH})`).join('') +
+    `(?:\\s+(${NUMBER_OR_DASH})\\s+(${NUMBER_OR_DASH}))?$`,
+);
+
+// The PSEI row has no Volume/Value columns:
+// "PSEI <Open> <High> <Low> <Close> <%Change> <Pt.Change>"
+const PSEI_ROW_REGEX = new RegExp(
+  `^PSEI` +
+    Array.from({ length: 6 }, () => `\\s+(${NUMBER_OR_DASH})`).join('') +
     '$',
 );
 
@@ -89,16 +124,52 @@ async function extractLines(pdfBuffer: Buffer): Promise<string[]> {
   return lines;
 }
 
-export async function parsePseEodReport(
-  pdfBuffer: Buffer,
-): Promise<PseEodRow[]> {
-  const lines = await extractLines(pdfBuffer);
+export function parseEodLines(lines: string[]): PseEodRow[] {
   const rows: PseEodRow[] = [];
+  let inDollarSection = false;
 
   for (const line of lines) {
     if (line.replace(/\s+/g, '') === DOLLAR_SECTION_MARKER) {
-      break;
+      inDollarSection = true;
+      continue;
     }
+    if (inDollarSection) {
+      if (line.startsWith(DOLLAR_SECTION_END_PREFIX)) {
+        inDollarSection = false;
+      }
+      continue;
+    }
+
+    const sectorMatch = SECTOR_ROW_REGEX.exec(line);
+    if (sectorMatch) {
+      const [, name, open, high, low, close, , , volume, value] = sectorMatch;
+      rows.push({
+        symbol: SECTOR_SYMBOLS[name],
+        open: parseNumberOrNull(open),
+        high: parseNumberOrNull(high),
+        low: parseNumberOrNull(low),
+        close: parseNumberOrNull(close),
+        volume: volume === undefined ? null : parseNumberOrNull(volume),
+        value: value === undefined ? null : parseNumberOrNull(value),
+      });
+      continue;
+    }
+
+    const pseiMatch = PSEI_ROW_REGEX.exec(line);
+    if (pseiMatch) {
+      const [, open, high, low, close] = pseiMatch;
+      rows.push({
+        symbol: 'PSEI',
+        open: parseNumberOrNull(open),
+        high: parseNumberOrNull(high),
+        low: parseNumberOrNull(low),
+        close: parseNumberOrNull(close),
+        volume: null,
+        value: null,
+      });
+      continue;
+    }
+
     const match = ROW_REGEX.exec(line);
     if (!match) {
       continue;
@@ -116,4 +187,11 @@ export async function parsePseEodReport(
   }
 
   return rows;
+}
+
+export async function parsePseEodReport(
+  pdfBuffer: Buffer,
+): Promise<PseEodRow[]> {
+  const lines = await extractLines(pdfBuffer);
+  return parseEodLines(lines);
 }
