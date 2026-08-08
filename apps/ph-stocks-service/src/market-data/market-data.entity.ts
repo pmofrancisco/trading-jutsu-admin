@@ -17,6 +17,7 @@ const numericTransformer = {
 @Index('IDX_market_data_symbol_timestamp', ['symbol', 'timestamp'], {
   unique: true,
 })
+@Index('IDX_market_data_timestamp', ['timestamp'])
 export class MarketData {
   @PrimaryGeneratedColumn('increment', { type: 'bigint' })
   id: string;
