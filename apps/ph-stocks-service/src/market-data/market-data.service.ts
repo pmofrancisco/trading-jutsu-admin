@@ -1,4 +1,6 @@
 import {
+  BadGatewayException,
+  BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
@@ -9,8 +11,61 @@ import { MarketData } from './market-data.entity';
 import { CreateMarketDataDto } from './dto/create-market-data.dto';
 import { UpdateMarketDataDto } from './dto/update-market-data.dto';
 import { QueryMarketDataDto } from './dto/query-market-data.dto';
+import { parsePseEodReport } from './pse-eod-report.parser';
 
 const POSTGRES_UNIQUE_VIOLATION = '23505';
+const PSE_EOD_REPORT_BASE_URL = 'https://documents.pse.com.ph/market_report';
+const MONTH_NAMES = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+];
+
+export interface ImportPseEodResult {
+  date: string;
+  sourceUrl: string;
+  imported: number;
+  skipped: number;
+}
+
+const DATE_PREFIX_REGEX = /^(\d{4})-(\d{2})-(\d{2})/;
+
+// Pulls the Y/M/D digits straight out of the string instead of going through
+// `new Date(string)`, whose local-vs-UTC interpretation depends on whether a
+// time component is present and the server's timezone (see PSE EOD import bug).
+function resolveReportDate(date?: string): Date {
+  if (!date) {
+    const now = new Date();
+    return new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+    );
+  }
+  const match = DATE_PREFIX_REGEX.exec(date);
+  if (!match) {
+    throw new BadRequestException(
+      `Invalid date "${date}"; expected format YYYY-MM-DD`,
+    );
+  }
+  const [, year, month, day] = match;
+  return new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+}
+
+function buildPseEodReportUrl(reportDate: Date): string {
+  const monthName = MONTH_NAMES[reportDate.getUTCMonth()];
+  const day = String(reportDate.getUTCDate()).padStart(2, '0');
+  const year = reportDate.getUTCFullYear();
+  const fileName = `${monthName} ${day}, ${year}-EOD.pdf`.replace(/ /g, '%20');
+  return `${PSE_EOD_REPORT_BASE_URL}/${fileName}`;
+}
 
 interface PostgresDriverError {
   code: string;
@@ -126,6 +181,58 @@ export class MarketDataService {
       conflictPaths: ['symbol', 'timestamp'],
       skipUpdateIfNoValuesChanged: true,
     });
+  }
+
+  async importPseEod(date?: string): Promise<ImportPseEodResult> {
+    const reportDate = resolveReportDate(date);
+    const sourceUrl = buildPseEodReportUrl(reportDate);
+
+    let response: Response;
+    try {
+      response = await fetch(sourceUrl);
+    } catch (error) {
+      throw new BadGatewayException(
+        `Failed to fetch PSE EOD report at ${sourceUrl}: ${(error as Error).message}`,
+      );
+    }
+    if (!response.ok) {
+      throw new NotFoundException(
+        `PSE EOD report not found at ${sourceUrl} (HTTP ${response.status})`,
+      );
+    }
+
+    const pdfBuffer = Buffer.from(await response.arrayBuffer());
+    const rows = await parsePseEodReport(pdfBuffer);
+
+    const candles: CreateMarketDataDto[] = rows
+      .filter(
+        (row) =>
+          row.open !== null &&
+          row.high !== null &&
+          row.low !== null &&
+          row.close !== null,
+      )
+      .map((row) => ({
+        symbol: row.symbol,
+        timestamp: reportDate,
+        open: row.open!,
+        high: row.high!,
+        low: row.low!,
+        close: row.close!,
+        volume: row.volume ?? 0,
+        turnover: row.value ?? 0,
+      }));
+
+    if (candles.length > 0) {
+      await this.bulkUpsert(candles);
+    }
+
+    return {
+      date: reportDate.toISOString(),
+      sourceUrl,
+      imported: candles.length,
+      skipped: rows.length - candles.length,
+    };
   }
 
   private async saveOrThrowConflict(
