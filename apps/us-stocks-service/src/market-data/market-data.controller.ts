@@ -14,6 +14,7 @@ import { CreateMarketDataDto } from './dto/create-market-data.dto';
 import { UpdateMarketDataDto } from './dto/update-market-data.dto';
 import { QueryMarketDataDto } from './dto/query-market-data.dto';
 import { BulkUpsertMarketDataDto } from './dto/bulk-upsert-market-data.dto';
+import { ImportEodDto } from './dto/import-eod.dto';
 
 @ApiTags('market-data')
 @Controller('market-data')
@@ -30,6 +31,14 @@ export class MarketDataController {
   @Post('bulk-upsert')
   bulkUpsert(@Body() dto: BulkUpsertMarketDataDto) {
     return this.marketDataService.bulkUpsert(dto.candles);
+  }
+
+  @ApiOperation({
+    summary: 'Import grouped end-of-day bars from Massive and bulk upsert them',
+  })
+  @Post('import/eod')
+  importEod(@Body() dto: ImportEodDto) {
+    return this.marketDataService.importEod(dto.date);
   }
 
   @ApiOperation({ summary: 'List market-data candles' })

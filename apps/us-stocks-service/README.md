@@ -11,8 +11,11 @@ cp .env.example .env   # then set DATABASE_URL
 pnpm migration:run     # creates the market_data table and its indexes
 ```
 
-`DATABASE_URL` is the only required environment variable. SSL is enabled
-automatically when the URL carries `sslmode=require`. `PORT` defaults to `3003`.
+`DATABASE_URL` is required. SSL is enabled automatically when the URL carries
+`sslmode=require`. `PORT` defaults to `3003`.
+
+`MASSIVE_BASE_URL` (e.g. `https://api.massive.com`) and `MASSIVE_API_KEY` are
+required by the EOD import only; the rest of the API runs without them.
 
 ## Run
 
@@ -31,6 +34,7 @@ All routes live under `/market-data`.
 | -------- | --------------------------- | ---------------------------------- |
 | `POST`   | `/market-data`              | Create a candle                    |
 | `POST`   | `/market-data/bulk-upsert`  | Insert or update many candles      |
+| `POST`   | `/market-data/import/eod`   | Import a day of EOD bars           |
 | `GET`    | `/market-data`              | List candles (filtered, paginated) |
 | `GET`    | `/market-data/:id`          | Fetch a candle by id               |
 | `PATCH`  | `/market-data/:id`          | Partially update a candle          |
@@ -58,6 +62,25 @@ half-ingested session behind. The JSON body limit is raised to 25mb in
 
 Repeating the same `(symbol, timestamp)` twice *within one request* returns
 `400` naming the offending pair, rather than silently keeping just one of them.
+
+### EOD import
+
+`POST /market-data/import/eod` takes an optional `{ "date": "2026-08-21" }`
+(defaulting to the current date), fetches that day's grouped daily bars from
+`GET {MASSIVE_BASE_URL}/v2/aggs/grouped/locale/us/market/stocks/{date}?adjusted=true`,
+and feeds them through the same bulk upsert, so re-running it for a date is a
+no-op. It returns `{ date, sourceUrl, imported, skipped }` — `sourceUrl` omits
+the API key.
+
+Each upstream bar maps as `T`→`symbol`, `o`/`h`/`l`/`c`→OHLC, `v`→`volume`, and
+`t` (Unix milliseconds, the start of the aggregate window) →`timestamp`. Massive
+carries no traded value, so `turnover` is `0`. Prices are rounded to the four
+decimals the column stores.
+
+Bars that cannot be stored — missing or non-positive prices, a price at or above
+`10^8`, a symbol over 20 characters — are skipped and counted in `skipped`
+rather than failing the day's import. An unreachable or erroring upstream
+returns `502`, and a `404` from Massive returns `404`.
 
 ## Migrations
 
