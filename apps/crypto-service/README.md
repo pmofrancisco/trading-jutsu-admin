@@ -1,98 +1,95 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# crypto-service
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+NestJS service exposing CRUD over cryptocurrency market data (OHLCV candles),
+backed by Postgres via TypeORM.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
-
-## Description
-
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
-
-## Project setup
+## Setup
 
 ```bash
-$ pnpm install
+pnpm install
+cp .env.example .env   # then set DATABASE_URL
+pnpm migration:run     # creates the market_data table and its indexes
 ```
 
-## Compile and run the project
+`DATABASE_URL` is required. SSL is enabled automatically when the URL carries
+`sslmode=require`. `PORT` defaults to `3002`.
+
+## Run
 
 ```bash
-# development
-$ pnpm run start
-
-# watch mode
-$ pnpm run start:dev
-
-# production mode
-$ pnpm run start:prod
+pnpm dev          # watch mode
+pnpm start:prod   # after pnpm build
 ```
 
-## Run tests
+Swagger UI is served at `http://localhost:3002/docs`.
+
+## API
+
+All routes live under `/market-data`.
+
+| Method   | Path                       | Description                        |
+| -------- | -------------------------- | ---------------------------------- |
+| `POST`   | `/market-data`             | Create a candle                    |
+| `POST`   | `/market-data/bulk-upsert` | Insert or update many candles      |
+| `GET`    | `/market-data`             | List candles (filtered, paginated) |
+| `GET`    | `/market-data/:id`         | Fetch a candle by id               |
+| `PATCH`  | `/market-data/:id`         | Partially update a candle          |
+| `DELETE` | `/market-data/:id`         | Delete a candle                    |
+
+List query parameters: `symbol`, `from`, `to` (ISO timestamps), `limit`
+(1–1000, default 100) and `offset` (default 0). Results are ordered by
+`timestamp` ascending.
+
+A candle is `{ symbol, timestamp, open, high, low, close, volume, turnover }`.
+`(symbol, timestamp)` is unique — creating or updating into a duplicate pair
+returns `409 Conflict`; an unknown id returns `404 Not Found`.
+
+### Precision
+
+Crypto spans a far wider price range than equities, so the columns are scaled
+for it rather than copied from the stock services:
+
+| Field                     | Column           | Notes                                            |
+| ------------------------- | ---------------- | ------------------------------------------------ |
+| `open` `high` `low` `close` | `numeric(24,12)` | 12 decimals — covers long-tail and alt/BTC pairs |
+| `volume`                  | `numeric(30,12)` | Base-asset units, fractional (e.g. `0.00341` BTC) |
+| `turnover`                | `numeric(24,8)`  | Quote-currency value traded                       |
+
+Eight decimals (satoshi precision) would be enough for majors but rounds tokens
+below `1e-8` to zero, so prices carry twelve. `volume` is `numeric`, not the
+`bigint` the equity services use, because crypto trades in fractional units.
+
+Values are validated against these scales at the edge, so anything Postgres
+would silently round is rejected with `400`. The check uses a local
+`@MaxDecimalPlaces` rather than class-validator's
+`@IsNumber({ maxDecimalPlaces })`, which throws on exponential values such as
+`1e-7` and undercounts ones such as `1.234e-13` — both routine at crypto scale.
+
+Rows are read back as JS numbers, which hold ~15–17 significant digits. That is
+ample for any single price, but the column stores more precision than the JSON
+response can express.
+
+### Bulk upsert
+
+`POST /market-data/bulk-upsert` takes `{ "candles": [ ... ] }` and returns
+`{ "upserted": n }`. Each candle is matched on `(symbol, timestamp)`: new pairs
+are inserted, existing ones updated. Re-sending an identical batch is a no-op,
+so an ingest job can safely retry.
+
+The batch runs in a single transaction and is split into chunks of 1000 to stay
+under the Postgres 65535 bound-parameter ceiling, so a partial failure leaves no
+half-ingested range behind. The JSON body limit is raised to 25mb in `main.ts`;
+the Express default of 100kb would cap a batch at roughly 680 candles.
+
+Repeating the same `(symbol, timestamp)` twice inside one request is rejected
+with `400` — Postgres cannot apply two `ON CONFLICT` updates to one row, so the
+duplicate is caller error rather than a conflict to resolve.
+
+## Migrations
 
 ```bash
-# unit tests
-$ pnpm run test
-
-# e2e tests
-$ pnpm run test:e2e
-
-# test coverage
-$ pnpm run test:cov
+pnpm migration:generate src/migrations/YourChange
+pnpm migration:run
+pnpm migration:show
+pnpm migration:revert
 ```
-
-## Deployment
-
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ pnpm install -g @nestjs/mau
-$ mau deploy
-```
-
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
-
-## Resources
-
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
