@@ -3,7 +3,7 @@ import { Type } from 'class-transformer';
 import { IsDate, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 
 export class QueryMarketDataDto {
-  @ApiPropertyOptional({ example: 'BTCUSDT' })
+  @ApiPropertyOptional({ example: 'BTC' })
   @IsOptional()
   @IsString()
   symbol?: string;

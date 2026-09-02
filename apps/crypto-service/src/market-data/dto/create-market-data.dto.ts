@@ -17,7 +17,7 @@ const VOLUME_DECIMALS = 12;
 const TURNOVER_DECIMALS = 8;
 
 export class CreateMarketDataDto {
-  @ApiProperty({ example: 'BTCUSDT', maxLength: 20 })
+  @ApiProperty({ example: 'BTC', maxLength: 20 })
   @IsString()
   @MaxLength(20)
   symbol: string;
