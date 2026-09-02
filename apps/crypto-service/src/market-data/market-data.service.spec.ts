@@ -13,7 +13,7 @@ import { MarketData } from './market-data.entity';
 import { CreateMarketDataDto } from './dto/create-market-data.dto';
 
 const candle: CreateMarketDataDto = {
-  symbol: 'BTCUSDT',
+  symbol: 'BTC',
   timestamp: new Date('2026-08-04T00:00:00.000Z'),
   open: 104523.87,
   high: 105980.12,
@@ -128,12 +128,12 @@ describe('MarketDataService', () => {
 
   describe('findAll', () => {
     it('applies only the filters that were supplied', async () => {
-      await service.findAll({ symbol: 'BTCUSDT' });
+      await service.findAll({ symbol: 'BTC' });
 
       expect(queryBuilder.andWhere).toHaveBeenCalledTimes(1);
       expect(queryBuilder.andWhere).toHaveBeenCalledWith(
         'marketData.symbol = :symbol',
-        { symbol: 'BTCUSDT' },
+        { symbol: 'BTC' },
       );
     });
 
@@ -141,7 +141,7 @@ describe('MarketDataService', () => {
       const from = new Date('2026-08-01T00:00:00.000Z');
       const to = new Date('2026-08-31T00:00:00.000Z');
 
-      await service.findAll({ symbol: 'BTCUSDT', from, to });
+      await service.findAll({ symbol: 'BTC', from, to });
 
       expect(queryBuilder.andWhere).toHaveBeenCalledTimes(3);
       expect(queryBuilder.andWhere).toHaveBeenCalledWith(
