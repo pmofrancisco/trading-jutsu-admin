@@ -1,9 +1,11 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import {
+  BadGatewayException,
   BadRequestException,
   ConflictException,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { QueryFailedError, Repository } from 'typeorm';
 import { MarketDataService } from './market-data.service';
@@ -21,6 +23,27 @@ const candle: CreateMarketDataDto = {
   turnover: 1348920455.31,
 };
 
+const MASSIVE_CONFIG: Record<string, string> = {
+  MASSIVE_BASE_URL: 'https://api.massive.test',
+  MASSIVE_API_KEY: 'test-key',
+};
+
+// One grouped daily bar as Massive returns it. `t` is the close of the daily
+// window, which is how the crypto feed stamps these bars.
+const bar = {
+  T: 'X:BTCUSD',
+  o: 104523.87,
+  h: 105980.12,
+  l: 103410.55,
+  c: 105204.3,
+  v: 12843.00341,
+  vw: 104900.5,
+  t: 1788220799999,
+  n: 481234,
+};
+
+const TRADING_DAY = new Date('2026-08-31T00:00:00.000Z');
+
 function uniqueViolation(): QueryFailedError {
   return new QueryFailedError('INSERT', [], {
     code: '23505',
@@ -33,6 +56,7 @@ describe('MarketDataService', () => {
   let queryBuilder: Record<string, jest.Mock>;
   let entityManager: { upsert: jest.Mock };
   let transaction: jest.Mock;
+  let fetchMock: jest.Mock;
 
   beforeEach(async () => {
     queryBuilder = {
@@ -42,6 +66,9 @@ describe('MarketDataService', () => {
       skip: jest.fn().mockReturnThis(),
       getMany: jest.fn().mockResolvedValue([]),
     };
+
+    fetchMock = jest.fn();
+    global.fetch = fetchMock;
 
     entityManager = { upsert: jest.fn().mockResolvedValue(undefined) };
     transaction = jest.fn((run: (manager: unknown) => Promise<unknown>) =>
@@ -60,6 +87,12 @@ describe('MarketDataService', () => {
             delete: jest.fn(),
             createQueryBuilder: jest.fn(() => queryBuilder),
             manager: { transaction },
+          },
+        },
+        {
+          provide: ConfigService,
+          useValue: {
+            getOrThrow: jest.fn((key: string) => MASSIVE_CONFIG[key]),
           },
         },
       ],
@@ -220,6 +253,206 @@ describe('MarketDataService', () => {
           { ...candle, timestamp: new Date('2026-08-05T00:00:00.000Z') },
         ]),
       ).resolves.toEqual({ upserted: 2 });
+    });
+  });
+
+  describe('importEod', () => {
+    const respondWith = (results: unknown): void => {
+      fetchMock.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ results }),
+      });
+    };
+
+    const upsertedCandles = (): CreateMarketDataDto[] =>
+      (entityManager.upsert.mock.calls as unknown[][]).flatMap(
+        (call) => call[1] as CreateMarketDataDto[],
+      );
+
+    it('maps an upstream bar onto a candle', async () => {
+      respondWith([bar]);
+
+      await service.importEod('2026-08-31');
+
+      expect(upsertedCandles()).toEqual([
+        {
+          symbol: 'BTC',
+          timestamp: TRADING_DAY,
+          open: 104523.87,
+          high: 105980.12,
+          low: 103410.55,
+          close: 105204.3,
+          volume: 12843.00341,
+          turnover: 0,
+        },
+      ]);
+    });
+
+    it('drops the pair notation from the symbol', async () => {
+      respondWith([
+        bar,
+        { ...bar, T: 'X:USDTUSD' },
+        { ...bar, T: 'X:1INCHUSD' },
+      ]);
+
+      await service.importEod('2026-08-31');
+
+      expect(upsertedCandles().map((c) => c.symbol)).toEqual([
+        'BTC',
+        'USDT',
+        '1INCH',
+      ]);
+    });
+
+    it('imports only USD pairs and counts the rest as filtered', async () => {
+      respondWith([
+        bar,
+        { ...bar, T: 'X:BTCEUR' },
+        { ...bar, T: 'X:ETHBTC' },
+        { ...bar, T: 'X:USD' },
+        { ...bar, T: 'AAPL' },
+        { ...bar, T: 42 },
+      ]);
+
+      const result = await service.importEod('2026-08-31');
+
+      expect(result).toMatchObject({ imported: 1, filtered: 5, skipped: 0 });
+      expect(upsertedCandles().map((c) => c.symbol)).toEqual(['BTC']);
+    });
+
+    it('floors the end-of-window timestamp to the day it closes', async () => {
+      respondWith([bar]);
+
+      await service.importEod('2026-08-31');
+
+      expect(upsertedCandles()[0].timestamp).toEqual(TRADING_DAY);
+    });
+
+    it('keeps the precision of a long-tail token', async () => {
+      respondWith([
+        { ...bar, T: 'X:FLOKIUSD', o: 2.393e-5, c: 8.99e-8, v: 2231979859.66 },
+      ]);
+
+      await service.importEod('2026-08-31');
+
+      expect(upsertedCandles()[0]).toMatchObject({
+        open: 2.393e-5,
+        close: 8.99e-8,
+        volume: 2231979859.66,
+      });
+    });
+
+    it('rounds to the twelve decimals the columns store', async () => {
+      respondWith([{ ...bar, o: 1.0000000000004, v: 2.0000000000006 }]);
+
+      await service.importEod('2026-08-31');
+
+      expect(upsertedCandles()[0]).toMatchObject({
+        open: 1,
+        volume: 2.000000000001,
+      });
+    });
+
+    it('requests the grouped bars for the given date with the api key', async () => {
+      respondWith([]);
+
+      await service.importEod('2026-08-31');
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        'https://api.massive.test/v2/aggs/grouped/locale/global/market/crypto/2026-08-31?adjusted=true&apiKey=test-key',
+      );
+    });
+
+    it('keeps the api key out of the reported source url', async () => {
+      respondWith([]);
+
+      const result = await service.importEod('2026-08-31');
+
+      expect(result.sourceUrl).not.toContain('test-key');
+      expect(result.sourceUrl).toBe(
+        'https://api.massive.test/v2/aggs/grouped/locale/global/market/crypto/2026-08-31?adjusted=true',
+      );
+    });
+
+    it('defaults to the current date', async () => {
+      respondWith([]);
+
+      const result = await service.importEod();
+
+      expect(result.date).toBe(new Date().toISOString().slice(0, 10));
+    });
+
+    it('rejects a malformed date before calling upstream', async () => {
+      await expect(service.importEod('31-08-2026')).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('skips USD bars that cannot be stored and reports the count', async () => {
+      respondWith([
+        bar,
+        { ...bar, T: 'X:NOPRICEUSD', o: null },
+        { ...bar, T: 'X:ZEROUSD', l: 0 },
+        { ...bar, T: 'X:HUGEUSD', h: 1e12 },
+        { ...bar, T: 'X:DUSTUSD', c: 4e-13 },
+        { ...bar, T: 'X:NOVOLUSD', v: -1 },
+        { ...bar, T: `X:${'A'.repeat(21)}USD` },
+        { ...bar, T: 'X:NOTIMEUSD', t: undefined },
+      ]);
+
+      const result = await service.importEod('2026-08-31');
+
+      expect(result).toMatchObject({ imported: 1, filtered: 1, skipped: 6 });
+      expect(upsertedCandles().map((c) => c.symbol)).toEqual(['BTC']);
+    });
+
+    it('does not touch the database when nothing is importable', async () => {
+      respondWith([]);
+
+      await expect(service.importEod('2026-08-31')).resolves.toMatchObject({
+        imported: 0,
+        filtered: 0,
+        skipped: 0,
+      });
+      expect(transaction).not.toHaveBeenCalled();
+    });
+
+    it('reports an unreachable upstream as a bad gateway', async () => {
+      fetchMock.mockRejectedValue(new Error('connection refused'));
+
+      await expect(service.importEod('2026-08-31')).rejects.toBeInstanceOf(
+        BadGatewayException,
+      );
+    });
+
+    it('reports an upstream error status as a bad gateway', async () => {
+      fetchMock.mockResolvedValue({ ok: false, status: 403, json: jest.fn() });
+
+      await expect(service.importEod('2026-08-31')).rejects.toBeInstanceOf(
+        BadGatewayException,
+      );
+    });
+
+    it('reports a missing report as not found', async () => {
+      fetchMock.mockResolvedValue({ ok: false, status: 404, json: jest.fn() });
+
+      await expect(service.importEod('2026-08-31')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+    });
+
+    it('rejects a payload without a results array', async () => {
+      fetchMock.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ status: 'ERROR' }),
+      });
+
+      await expect(service.importEod('2026-08-31')).rejects.toBeInstanceOf(
+        BadGatewayException,
+      );
     });
   });
 

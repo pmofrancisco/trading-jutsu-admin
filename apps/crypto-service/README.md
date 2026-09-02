@@ -14,6 +14,9 @@ pnpm migration:run     # creates the market_data table and its indexes
 `DATABASE_URL` is required. SSL is enabled automatically when the URL carries
 `sslmode=require`. `PORT` defaults to `3002`.
 
+`MASSIVE_BASE_URL` (e.g. `https://api.massive.com`) and `MASSIVE_API_KEY` are
+required by the EOD import only; the rest of the API runs without them.
+
 ## Run
 
 ```bash
@@ -31,6 +34,7 @@ All routes live under `/market-data`.
 | -------- | -------------------------- | ---------------------------------- |
 | `POST`   | `/market-data`             | Create a candle                    |
 | `POST`   | `/market-data/bulk-upsert` | Insert or update many candles      |
+| `POST`   | `/market-data/import/eod`  | Import a day of EOD bars           |
 | `GET`    | `/market-data`             | List candles (filtered, paginated) |
 | `GET`    | `/market-data/:id`         | Fetch a candle by id               |
 | `PATCH`  | `/market-data/:id`         | Partially update a candle          |
@@ -84,6 +88,36 @@ the Express default of 100kb would cap a batch at roughly 680 candles.
 Repeating the same `(symbol, timestamp)` twice inside one request is rejected
 with `400` — Postgres cannot apply two `ON CONFLICT` updates to one row, so the
 duplicate is caller error rather than a conflict to resolve.
+
+### EOD import
+
+`POST /market-data/import/eod` takes an optional `{ "date": "2026-08-31" }`
+(defaulting to the current date), fetches that day's grouped daily bars from
+`GET {MASSIVE_BASE_URL}/v2/aggs/grouped/locale/global/market/crypto/{date}?adjusted=true`,
+and feeds them through the same bulk upsert, so re-running it for a date is a
+no-op. It returns `{ date, sourceUrl, imported, filtered, skipped }` —
+`sourceUrl` omits the API key.
+
+Only USD pairs are imported, and the pair notation is dropped from the stored
+symbol: `X:BTCUSD` is saved as `BTC`. Everything else Massive returns —
+`X:BTCEUR`, `X:ETHBTC` and the rest — is counted in `filtered` and never
+stored. Roughly a fifth of a day's ~400 bars are non-USD quotes, so `filtered`
+is expected to be non-zero; `skipped` counts USD pairs that could *not* be
+stored, and is the number worth watching.
+
+Each upstream bar maps as `T`→`symbol`, `o`/`h`/`l`/`c`→OHLC and `v`→`volume`.
+Massive carries no traded value, so `turnover` is `0`. Unlike the equity feed,
+`t` marks the *close* of the daily window (`23:59:59.999` UTC), so it is floored
+to the day it closes — a candle for 2026-08-31 is keyed at
+`2026-08-31T00:00:00.000Z`. Prices and volumes are rounded to the twelve
+decimals the columns store.
+
+Bars that cannot be stored — missing or non-positive prices, a price at or above
+`10^12` or a volume at or above `10^18` that would overflow the column, a price
+below `10^-12` that would round away to zero, a base symbol over 20 characters —
+are skipped and counted in `skipped` rather than failing the day's import. An
+unreachable or erroring upstream returns `502`, and a `404` from Massive returns
+`404`.
 
 ## Migrations
 
