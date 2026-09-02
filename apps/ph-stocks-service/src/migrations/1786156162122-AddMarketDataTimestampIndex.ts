@@ -1,8 +1,6 @@
 import { MigrationInterface, QueryRunner } from 'typeorm';
 
-export class AddMarketDataTimestampIndex1786156162122
-  implements MigrationInterface
-{
+export class AddMarketDataTimestampIndex1786156162122 implements MigrationInterface {
   name = 'AddMarketDataTimestampIndex1786156162122';
 
   public async up(queryRunner: QueryRunner): Promise<void> {
