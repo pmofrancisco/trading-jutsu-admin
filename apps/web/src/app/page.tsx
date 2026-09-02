@@ -22,7 +22,7 @@ export default function Home() {
           <button
             type="button"
             disabled
-            title="Not connected -- POST /market-data/import/pse-eod"
+            title="Not connected -- POST /market-data/import/eod"
             className="cursor-not-allowed border border-rule px-3 py-1.5 font-mono text-xs uppercase tracking-wide text-muted"
           >
             Run PSE EOD Import

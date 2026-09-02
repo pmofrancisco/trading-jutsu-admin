@@ -14,7 +14,7 @@ import { CreateMarketDataDto } from './dto/create-market-data.dto';
 import { UpdateMarketDataDto } from './dto/update-market-data.dto';
 import { QueryMarketDataDto } from './dto/query-market-data.dto';
 import { BulkUpsertMarketDataDto } from './dto/bulk-upsert-market-data.dto';
-import { ImportPseEodDto } from './dto/import-pse-eod.dto';
+import { ImportEodDto } from './dto/import-eod.dto';
 
 @ApiTags('market-data')
 @Controller('market-data')
@@ -36,9 +36,9 @@ export class MarketDataController {
   @ApiOperation({
     summary: 'Import a PSE end-of-day report and bulk upsert its candles',
   })
-  @Post('import/pse-eod')
-  importPseEod(@Body() dto: ImportPseEodDto) {
-    return this.marketDataService.importPseEod(dto.date);
+  @Post('import/eod')
+  importEod(@Body() dto: ImportEodDto) {
+    return this.marketDataService.importEod(dto.date);
   }
 
   @ApiOperation({ summary: 'List market-data candles' })

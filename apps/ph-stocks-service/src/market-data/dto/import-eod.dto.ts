@@ -1,7 +1,7 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { IsDateString, IsOptional } from 'class-validator';
 
-export class ImportPseEodDto {
+export class ImportEodDto {
   @ApiPropertyOptional({
     example: '2026-08-07',
     description:

@@ -30,7 +30,7 @@ const MONTH_NAMES = [
   'December',
 ];
 
-export interface ImportPseEodResult {
+export interface ImportEodResult {
   date: string;
   sourceUrl: string;
   imported: number;
@@ -138,7 +138,7 @@ export class MarketDataService {
     });
   }
 
-  async importPseEod(date?: string): Promise<ImportPseEodResult> {
+  async importEod(date?: string): Promise<ImportEodResult> {
     const reportDate = resolveReportDate(date);
     const sourceUrl = buildPseEodReportUrl(reportDate);
 
