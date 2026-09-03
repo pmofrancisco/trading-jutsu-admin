@@ -7,11 +7,12 @@ backed by Postgres via TypeORM.
 
 ```bash
 pnpm install
-cp .env.example .env   # then set DATABASE_URL
+cp .env.example .env   # then set DATABASE_URL and MASSIVE_API_KEY
 pnpm migration:run     # creates the market_data table and its indexes
 ```
 
-`DATABASE_URL` is required. SSL is enabled automatically when the URL carries
+`DATABASE_URL` is required, as are `MASSIVE_BASE_URL` and `MASSIVE_API_KEY` for
+the EOD import route. SSL is enabled automatically when the URL carries
 `sslmode=require`. `PORT` defaults to `3004`.
 
 ## Run
@@ -31,6 +32,7 @@ All routes live under `/market-data`.
 | -------- | -------------------------- | ---------------------------------- |
 | `POST`   | `/market-data`             | Create a candle                    |
 | `POST`   | `/market-data/bulk-upsert` | Insert or update many candles      |
+| `POST`   | `/market-data/import/eod`  | Import a day of EOD bars           |
 | `GET`    | `/market-data`             | List candles (filtered, paginated) |
 | `GET`    | `/market-data/:id`         | Fetch a candle by id               |
 | `PATCH`  | `/market-data/:id`         | Partially update a candle          |
@@ -45,9 +47,8 @@ with `symbol` a pair such as `EURUSD`. `(symbol, timestamp)` is unique —
 creating or updating into a duplicate pair returns `409 Conflict`; an unknown id
 returns `404 Not Found`.
 
-There is no EOD import route. Spot forex has no single end-of-day publication to
-pull from the way `ph-stocks-service` scrapes the PSE report; candles arrive
-through `bulk-upsert` from whichever feed you point at it.
+Candles arrive either through `bulk-upsert`, from whichever feed you point at
+it, or through the EOD import route below.
 
 ### Precision
 
@@ -91,6 +92,41 @@ duplicate is caller error rather than a conflict to resolve.
 
 Note that an upsert replaces the whole row: sending a candle without `volume`
 over an existing one that had a volume clears it to `null`.
+
+### EOD import
+
+`POST /market-data/import/eod` takes an optional `{ "date": "2026-09-02" }`
+(defaulting to the current date), fetches that day's grouped daily bars from
+`GET {MASSIVE_BASE_URL}/v2/aggs/grouped/locale/global/market/fx/{date}?adjusted=true`,
+and feeds them through the same bulk upsert, so re-running it for a date is a
+no-op. It returns `{ date, sourceUrl, imported, skipped }` — `sourceUrl` omits
+the API key.
+
+The `C:` prefix is dropped from the stored symbol: `C:EURUSD` is saved as
+`EURUSD`. Every pair Massive returns is imported, whatever its quote currency —
+crosses such as `C:AUDNOK` and `C:DKKPLN` are stored alongside the majors, about
+1200 pairs a day. (This is the one place forex differs from `crypto-service`,
+which imports only USD pairs and reports a `filtered` count.)
+
+Each upstream bar maps as `T`→`symbol`, `o`/`h`/`l`/`c`→OHLC and `v`→`volume`.
+`v` is a tick count, which is exactly what this service's nullable `volume` is
+for; Massive carries no traded value, so `turnover` is `null` rather than a
+fabricated `0`. Like the crypto feed and unlike the equity one, `t` marks the
+_close_ of the daily window (`23:59:59.999` UTC), so it is floored to the day it
+closes — a candle for 2026-09-02 is keyed at `2026-09-02T00:00:00.000Z`, the
+same key a candle ingested through `bulk-upsert` carries.
+
+Bars that cannot be stored — a ticker without the `C:` prefix, a symbol over 20
+characters, missing or non-positive prices, a price at or above `10^12` that
+would overflow the column, or a price below `5×10^-7` that would round away to
+zero — are skipped and counted in `skipped` rather than failing the day's
+import. An unusable `v` is _not_ one of these: it stores `null` and keeps the
+prices. An unreachable or erroring upstream returns `502`, and a `404` from
+Massive returns `404`.
+
+Note that `numeric(18,6)` limits how much of an exotic pair survives: `C:LBPUSD`
+around `1.1×10^-5` keeps two significant digits. Majors and ordinary crosses are
+unaffected.
 
 ## Migrations
 
