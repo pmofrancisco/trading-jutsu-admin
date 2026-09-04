@@ -10,6 +10,7 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { QueryFailedError, Repository } from 'typeorm';
 import { MarketDataService } from './market-data.service';
 import { MarketData } from './market-data.entity';
+import { CurrencyPairService } from '../currency-pair/currency-pair.service';
 import { CreateMarketDataDto } from './dto/create-market-data.dto';
 
 const candle: CreateMarketDataDto = {
@@ -54,10 +55,40 @@ const bar = {
 
 const TRADING_DAY = new Date('2026-09-02T00:00:00.000Z');
 
-function uniqueViolation(): QueryFailedError {
+// What `currency_pair` holds for these tests. Every symbol the import fixtures
+// use is registered, so a bar the import drops is dropped for the reason the
+// test is about rather than for being unregistered by accident.
+const REGISTERED_SYMBOLS = [
+  'EURUSD',
+  'AUDNOK',
+  'USDJPY',
+  'DKKPLN',
+  'EURCNH',
+  'NOVOL',
+  'NEGVOL',
+  'HUGEVOL',
+  'LBPUSD',
+  'NOPRICE',
+  'ZERO',
+  'HUGE',
+  'DUST',
+  'NOTIME',
+];
+
+function violation(code: string): QueryFailedError {
   return new QueryFailedError('INSERT', [], {
-    code: '23505',
+    code,
   } as unknown as Error);
+}
+
+function uniqueViolation(): QueryFailedError {
+  return violation('23505');
+}
+
+// What Postgres raises when a candle names a pair `currency_pair` does not
+// list.
+function foreignKeyViolation(): QueryFailedError {
+  return violation('23503');
 }
 
 describe('MarketDataService', () => {
@@ -67,6 +98,7 @@ describe('MarketDataService', () => {
   let entityManager: { upsert: jest.Mock };
   let transaction: jest.Mock;
   let fetchMock: jest.Mock;
+  let findAllSymbols: jest.Mock;
 
   beforeEach(async () => {
     queryBuilder = {
@@ -79,6 +111,8 @@ describe('MarketDataService', () => {
 
     fetchMock = jest.fn();
     global.fetch = fetchMock;
+
+    findAllSymbols = jest.fn().mockResolvedValue(new Set(REGISTERED_SYMBOLS));
 
     entityManager = { upsert: jest.fn().mockResolvedValue(undefined) };
     transaction = jest.fn((run: (manager: unknown) => Promise<unknown>) =>
@@ -98,6 +132,10 @@ describe('MarketDataService', () => {
             createQueryBuilder: jest.fn(() => queryBuilder),
             manager: { transaction },
           },
+        },
+        {
+          provide: CurrencyPairService,
+          useValue: { findAllSymbols },
         },
         {
           provide: ConfigService,
@@ -136,6 +174,14 @@ describe('MarketDataService', () => {
 
       await expect(service.create(candle)).rejects.toBeInstanceOf(
         ConflictException,
+      );
+    });
+
+    it('translates an unregistered pair into a bad request', async () => {
+      repository.save.mockRejectedValue(foreignKeyViolation());
+
+      await expect(service.create(candle)).rejects.toBeInstanceOf(
+        BadRequestException,
       );
     });
 
@@ -276,6 +322,21 @@ describe('MarketDataService', () => {
 
       expect(transaction).not.toHaveBeenCalled();
       expect(entityManager.upsert).not.toHaveBeenCalled();
+    });
+
+    it('translates an unregistered pair into a bad request', async () => {
+      transaction.mockRejectedValue(foreignKeyViolation());
+
+      await expect(service.bulkUpsert([candle])).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+    });
+
+    it('rethrows unrelated database errors', async () => {
+      const error = new Error('connection lost');
+      transaction.mockRejectedValue(error);
+
+      await expect(service.bulkUpsert([candle])).rejects.toBe(error);
     });
 
     it('allows the same symbol at different timestamps', async () => {
@@ -435,6 +496,63 @@ describe('MarketDataService', () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
+    it('imports only the pairs that are registered', async () => {
+      findAllSymbols.mockResolvedValue(new Set(['EURUSD', 'USDJPY']));
+      respondWith([bar, { ...bar, T: 'C:AUDNOK' }, { ...bar, T: 'C:USDJPY' }]);
+
+      const result = await service.importEod('2026-09-02');
+
+      expect(result).toMatchObject({
+        imported: 2,
+        skipped: 0,
+        unregistered: 1,
+      });
+      expect(upsertedCandles().map((c) => c.symbol)).toEqual([
+        'EURUSD',
+        'USDJPY',
+      ]);
+    });
+
+    // An unregistered pair is not a malformed bar, and the two counts are read
+    // for different reasons: one is a pair worth registering, the other a feed
+    // problem.
+    it('counts an unregistered pair apart from an unusable bar', async () => {
+      findAllSymbols.mockResolvedValue(new Set(['EURUSD', 'NOTIME']));
+      respondWith([
+        bar,
+        { ...bar, T: 'C:AUDNOK' },
+        { ...bar, T: 'C:DKKPLN' },
+        { ...bar, T: 'C:NOTIME', t: undefined },
+      ]);
+
+      await expect(service.importEod('2026-09-02')).resolves.toMatchObject({
+        imported: 1,
+        skipped: 1,
+        unregistered: 2,
+      });
+    });
+
+    it('imports nothing when no pair is registered', async () => {
+      findAllSymbols.mockResolvedValue(new Set<string>());
+      respondWith([bar, { ...bar, T: 'C:USDJPY' }]);
+
+      await expect(service.importEod('2026-09-02')).resolves.toMatchObject({
+        imported: 0,
+        skipped: 0,
+        unregistered: 2,
+      });
+      expect(transaction).not.toHaveBeenCalled();
+    });
+
+    // One read of the reference table for the whole day, not one per bar.
+    it('reads the registered pairs once per import', async () => {
+      respondWith([bar, { ...bar, T: 'C:USDJPY' }, { ...bar, T: 'C:AUDNOK' }]);
+
+      await service.importEod('2026-09-02');
+
+      expect(findAllSymbols).toHaveBeenCalledTimes(1);
+    });
+
     it('skips bars that cannot be stored and reports the count', async () => {
       respondWith([
         bar,
@@ -450,7 +568,11 @@ describe('MarketDataService', () => {
 
       const result = await service.importEod('2026-09-02');
 
-      expect(result).toMatchObject({ imported: 1, skipped: 8 });
+      expect(result).toMatchObject({
+        imported: 1,
+        skipped: 8,
+        unregistered: 0,
+      });
       expect(upsertedCandles().map((c) => c.symbol)).toEqual(['EURUSD']);
     });
 

@@ -5,7 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { QueryFailedError, Repository } from 'typeorm';
+import { DeleteResult, QueryFailedError, Repository } from 'typeorm';
 import { CurrencyPair } from './currency-pair.entity';
 import { toSymbol } from './currency-pair.constants';
 import { CreateCurrencyPairDto } from './dto/create-currency-pair.dto';
@@ -18,7 +18,7 @@ const POSTGRES_UNIQUE_VIOLATION = '23505';
 
 // A pair naming a currency that is not in the reference table trips the
 // foreign key rather than any check this service could do without a second
-// query.
+// query -- as does deleting a pair that still has market data.
 const POSTGRES_FOREIGN_KEY_VIOLATION = '23503';
 
 export interface BulkUpsertResult {
@@ -148,10 +148,33 @@ export class CurrencyPairService {
   }
 
   async remove(symbol: string): Promise<void> {
-    const result = await this.currencyPairRepository.delete(symbol);
+    let result: DeleteResult;
+    try {
+      result = await this.currencyPairRepository.delete(symbol);
+    } catch (error) {
+      // `market_data.symbol` references this row under RESTRICT, so unregistering
+      // a pair that has price history is refused by the database. Say so, rather
+      // than letting the constraint surface as a 500.
+      if (driverErrorCode(error) === POSTGRES_FOREIGN_KEY_VIOLATION) {
+        throw new ConflictException(
+          `Currency pair "${symbol}" still has market data; delete its candles first`,
+        );
+      }
+      throw error;
+    }
     if (result.affected === 0) {
       throw new NotFoundException(`Currency pair "${symbol}" not found`);
     }
+  }
+
+  // The registered markets, as the set an import filters against. Every column
+  // but the key is irrelevant here, so this selects the key alone -- the table
+  // is a reference list of markets, small enough to read whole.
+  async findAllSymbols(): Promise<Set<string>> {
+    const rows = await this.currencyPairRepository.find({
+      select: { symbol: true },
+    });
+    return new Set(rows.map((row) => row.symbol));
   }
 
   // Registering the same pair list twice is the expected case -- a seed rerun,

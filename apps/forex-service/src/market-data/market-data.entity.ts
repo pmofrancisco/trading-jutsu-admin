@@ -3,9 +3,12 @@ import {
   CreateDateColumn,
   Entity,
   Index,
+  JoinColumn,
+  ManyToOne,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
+import { CurrencyPair } from '../currency-pair/currency-pair.entity';
 
 const numericTransformer = {
   to: (value?: number | null) => value,
@@ -33,8 +36,18 @@ export class MarketData {
   @PrimaryGeneratedColumn('increment', { type: 'bigint' })
   id: string;
 
+  // The market this candle belongs to. Only a registered pair may appear here;
+  // the foreign key that enforces it is declared in the migration, since these
+  // are hand-written.
   @Column({ type: 'varchar', length: 20 })
   symbol: string;
+
+  // The scalar column above is what the service reads and writes; this relation
+  // exists so a query can join to the pair -- and through it to the two
+  // currencies -- without a second round trip.
+  @ManyToOne(() => CurrencyPair, { onDelete: 'RESTRICT', nullable: false })
+  @JoinColumn({ name: 'symbol', referencedColumnName: 'symbol' })
+  currencyPair: CurrencyPair;
 
   @Column({ type: 'timestamptz' })
   timestamp: Date;

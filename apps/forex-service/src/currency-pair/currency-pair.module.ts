@@ -8,5 +8,8 @@ import { CurrencyPairService } from './currency-pair.service';
   imports: [TypeOrmModule.forFeature([CurrencyPair])],
   controllers: [CurrencyPairController],
   providers: [CurrencyPairService],
+  // MarketDataModule filters an import against the registered pairs, and reads
+  // them through this service rather than reaching for the repository itself.
+  exports: [CurrencyPairService],
 })
 export class CurrencyPairModule {}

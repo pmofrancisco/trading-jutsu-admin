@@ -9,11 +9,16 @@ import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { QueryFailedError, Repository } from 'typeorm';
 import { MarketData } from './market-data.entity';
+import { CurrencyPairService } from '../currency-pair/currency-pair.service';
 import { CreateMarketDataDto } from './dto/create-market-data.dto';
 import { UpdateMarketDataDto } from './dto/update-market-data.dto';
 import { QueryMarketDataDto } from './dto/query-market-data.dto';
 
 const POSTGRES_UNIQUE_VIOLATION = '23505';
+
+// A candle naming a pair that is not registered trips the foreign key on
+// `market_data.symbol`.
+const POSTGRES_FOREIGN_KEY_VIOLATION = '23503';
 
 // Postgres caps a statement at 65535 bound parameters; each candle binds 8, so
 // batches are split to keep a large upsert well inside that ceiling.
@@ -51,6 +56,12 @@ export interface ImportEodResult {
   sourceUrl: string;
   imported: number;
   skipped: number;
+  // Bars for a well-formed pair that is not in `currency_pair`. Counted apart
+  // from `skipped` because it means something different: the bar was fine, the
+  // market simply is not one this service tracks. On a typical day the feed
+  // carries an order of magnitude more pairs than are registered, so folding
+  // the two together would bury the bars that were genuinely unusable.
+  unregistered: number;
 }
 
 // A grouped daily bar as returned by the Massive API. Every field is optional
@@ -203,12 +214,11 @@ interface PostgresDriverError {
   code: string;
 }
 
-function isUniqueViolation(error: unknown): boolean {
+function driverErrorCode(error: unknown): string | undefined {
   if (!(error instanceof QueryFailedError)) {
-    return false;
+    return undefined;
   }
-  const driverError = error.driverError as PostgresDriverError | undefined;
-  return driverError?.code === POSTGRES_UNIQUE_VIOLATION;
+  return (error.driverError as PostgresDriverError | undefined)?.code;
 }
 
 @Injectable()
@@ -216,6 +226,7 @@ export class MarketDataService {
   constructor(
     @InjectRepository(MarketData)
     private readonly marketDataRepository: Repository<MarketData>,
+    private readonly currencyPairService: CurrencyPairService,
     private readonly configService: ConfigService,
   ) {}
 
@@ -272,18 +283,31 @@ export class MarketDataService {
 
     // One transaction across every chunk, so a failure part way through a
     // large batch leaves no partially ingested range behind.
-    await this.marketDataRepository.manager.transaction(async (manager) => {
-      for (let i = 0; i < rows.length; i += BULK_UPSERT_CHUNK_SIZE) {
-        await manager.upsert(
-          MarketData,
-          rows.slice(i, i + BULK_UPSERT_CHUNK_SIZE),
-          {
-            conflictPaths: ['symbol', 'timestamp'],
-            skipUpdateIfNoValuesChanged: true,
-          },
+    try {
+      await this.marketDataRepository.manager.transaction(async (manager) => {
+        for (let i = 0; i < rows.length; i += BULK_UPSERT_CHUNK_SIZE) {
+          await manager.upsert(
+            MarketData,
+            rows.slice(i, i + BULK_UPSERT_CHUNK_SIZE),
+            {
+              conflictPaths: ['symbol', 'timestamp'],
+              skipUpdateIfNoValuesChanged: true,
+            },
+          );
+        }
+      });
+    } catch (error) {
+      // The foreign key names the offending row, but the driver reports only
+      // the constraint, so the message stays about the batch. `importEod`
+      // filters beforehand, so reaching this means a caller sent an
+      // unregistered pair directly.
+      if (driverErrorCode(error) === POSTGRES_FOREIGN_KEY_VIOLATION) {
+        throw new BadRequestException(
+          'One or more candles name a currency pair that is not registered',
         );
       }
-    });
+      throw error;
+    }
 
     return { upserted: rows.length };
   }
@@ -332,12 +356,32 @@ export class MarketDataService {
       );
     }
 
-    const candles = payload.results
-      .map((bar) => {
-        const symbol = toSymbol(bar.T);
-        return symbol === null ? null : toCandle(symbol, bar);
-      })
-      .filter((candle): candle is CreateMarketDataDto => candle !== null);
+    // The feed carries every pair Massive quotes; this service tracks the ones
+    // in `currency_pair`. Filtering here rather than letting the foreign key
+    // reject the batch is the difference between importing the registered
+    // pairs and importing nothing at all.
+    const registeredSymbols = await this.currencyPairService.findAllSymbols();
+
+    const candles: CreateMarketDataDto[] = [];
+    let unregistered = 0;
+
+    for (const bar of payload.results) {
+      const symbol = toSymbol(bar.T);
+      if (symbol === null) {
+        continue;
+      }
+      // Checked before the bar is parsed: an unregistered pair is dropped for
+      // that reason whatever else is wrong with it, which keeps the counts
+      // from depending on the order the two checks happen to run in.
+      if (!registeredSymbols.has(symbol)) {
+        unregistered += 1;
+        continue;
+      }
+      const candle = toCandle(symbol, bar);
+      if (candle !== null) {
+        candles.push(candle);
+      }
+    }
 
     if (candles.length > 0) {
       await this.bulkUpsert(candles);
@@ -347,7 +391,8 @@ export class MarketDataService {
       date: tradingDate,
       sourceUrl,
       imported: candles.length,
-      skipped: payload.results.length - candles.length,
+      skipped: payload.results.length - candles.length - unregistered,
+      unregistered,
     };
   }
 
@@ -357,9 +402,17 @@ export class MarketDataService {
     try {
       return await this.marketDataRepository.save(marketData);
     } catch (error) {
-      if (isUniqueViolation(error)) {
+      const code = driverErrorCode(error);
+      if (code === POSTGRES_UNIQUE_VIOLATION) {
         throw new ConflictException(
           `Market data for symbol "${marketData.symbol}" at ${marketData.timestamp.toISOString()} already exists`,
+        );
+      }
+      // Every candle has to name a market listed in `currency_pair`, and the
+      // foreign key is what enforces it.
+      if (code === POSTGRES_FOREIGN_KEY_VIOLATION) {
+        throw new BadRequestException(
+          `Currency pair "${marketData.symbol}" is not registered`,
         );
       }
       throw error;

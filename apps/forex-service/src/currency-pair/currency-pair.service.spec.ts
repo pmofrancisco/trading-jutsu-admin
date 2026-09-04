@@ -52,6 +52,7 @@ describe('CurrencyPairService', () => {
     repository = {
       insert: jest.fn(),
       upsert: jest.fn(),
+      find: jest.fn().mockResolvedValue([]),
       findOneBy: jest.fn(),
       delete: jest.fn(),
       createQueryBuilder: jest.fn(() => queryBuilder),
@@ -155,6 +156,45 @@ describe('CurrencyPairService', () => {
       await expect(service.remove('EURUSD')).rejects.toBeInstanceOf(
         NotFoundException,
       );
+    });
+
+    // market_data references the pair under RESTRICT, so unregistering a
+    // market that still has candles is refused rather than taking its price
+    // history with it.
+    it('reports a pair that still has market data as a conflict', async () => {
+      repository.delete.mockRejectedValue(driverError('23503'));
+
+      await expect(service.remove('EURUSD')).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+    });
+
+    it('rethrows unrelated database errors', async () => {
+      const error = new Error('connection lost');
+      repository.delete.mockRejectedValue(error);
+
+      await expect(service.remove('EURUSD')).rejects.toBe(error);
+    });
+  });
+
+  describe('findAllSymbols', () => {
+    it('returns the registered symbols as a set', async () => {
+      repository.find.mockResolvedValue([
+        { symbol: 'EURUSD' },
+        { symbol: 'XAUUSD' },
+      ]);
+
+      await expect(service.findAllSymbols()).resolves.toEqual(
+        new Set(['EURUSD', 'XAUUSD']),
+      );
+    });
+
+    it('selects the key alone', async () => {
+      await service.findAllSymbols();
+
+      expect(repository.find).toHaveBeenCalledWith({
+        select: { symbol: true },
+      });
     });
   });
 
