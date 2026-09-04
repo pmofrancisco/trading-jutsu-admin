@@ -9,7 +9,7 @@ TypeORM.
 ```bash
 pnpm install
 cp .env.example .env   # then set DATABASE_URL and MASSIVE_API_KEY
-pnpm migration:run     # creates the market_data and currency tables
+pnpm migration:run     # creates the market_data, currency and currency_pair tables
 ```
 
 `DATABASE_URL` is required, as are `MASSIVE_BASE_URL` and `MASSIVE_API_KEY` for
@@ -49,6 +49,10 @@ A candle is `{ symbol, timestamp, open, high, low, close, volume, turnover }`,
 with `symbol` a pair such as `EURUSD`. `(symbol, timestamp)` is unique —
 creating or updating into a duplicate pair returns `409 Conflict`; an unknown id
 returns `404 Not Found`.
+
+`symbol` is a foreign key into `currency_pair`: a candle can only name a market
+that has been registered, and one that names anything else is a `400` rather
+than a row nobody asked for. See [Currency pairs](#currency-pairs).
 
 Candles arrive either through `bulk-upsert`, from whichever feed you point at
 it, or through the EOD import route below.
@@ -102,14 +106,16 @@ over an existing one that had a volume clears it to `null`.
 (defaulting to the current date), fetches that day's grouped daily bars from
 `GET {MASSIVE_BASE_URL}/v2/aggs/grouped/locale/global/market/fx/{date}?adjusted=true`,
 and feeds them through the same bulk upsert, so re-running it for a date is a
-no-op. It returns `{ date, sourceUrl, imported, skipped }` — `sourceUrl` omits
-the API key.
+no-op. It returns `{ date, sourceUrl, imported, skipped, unregistered }` —
+`sourceUrl` omits the API key.
 
 The `C:` prefix is dropped from the stored symbol: `C:EURUSD` is saved as
-`EURUSD`. Every pair Massive returns is imported, whatever its quote currency —
-crosses such as `C:AUDNOK` and `C:DKKPLN` are stored alongside the majors, about
-1200 pairs a day. (This is the one place forex differs from `crypto-service`,
-which imports only USD pairs and reports a `filtered` count.)
+`EURUSD`. Massive quotes about 1200 pairs a day and this service tracks the ones
+in `currency_pair`, so a bar for an unlisted market is dropped and counted in
+`unregistered` — registering the pair is what turns the import on for it. Quote
+currency is not what decides: a cross such as `C:AUDNOK` is imported like any
+major, as long as it is registered. (`crypto-service` filters by quote currency
+instead and reports a `filtered` count.)
 
 Each upstream bar maps as `T`→`symbol`, `o`/`h`/`l`/`c`→OHLC and `v`→`volume`.
 `v` is a tick count, which is exactly what this service's nullable `volume` is
@@ -127,9 +133,37 @@ import. An unusable `v` is _not_ one of these: it stores `null` and keeps the
 prices. An unreachable or erroring upstream returns `502`, and a `404` from
 Massive returns `404`.
 
+`skipped` and `unregistered` are counted apart because they mean different
+things: a bar in `unregistered` was perfectly good and names a pair you may want
+to register, while one in `skipped` is a feed problem. The registry is checked
+first, so a bar that is both counts as `unregistered`.
+
 Note that `numeric(18,6)` limits how much of an exotic pair survives: `C:LBPUSD`
 around `1.1×10^-5` keeps two significant digits. Majors and ordinary crosses are
 unaffected.
+
+### Currency pairs
+
+`/currency-pairs` is the list of markets this service tracks — one row per
+tradeable pair, naming which currency is bought (`base`) and which it is priced
+in (`quote`). `symbol` is the two ISO codes run together and is derived rather
+than supplied, so `EUR` against `USD` is `EURUSD`.
+
+| Method   | Path                          | Description                      |
+| -------- | ----------------------------- | -------------------------------- |
+| `POST`   | `/currency-pairs`             | Register a pair                  |
+| `POST`   | `/currency-pairs/bulk-upsert` | Register many pairs              |
+| `GET`    | `/currency-pairs`             | List pairs (filtered, paginated) |
+| `GET`    | `/currency-pairs/:symbol`     | Fetch a pair by symbol           |
+| `DELETE` | `/currency-pairs/:symbol`     | Unregister a pair                |
+
+This table is what `market_data.symbol` references, which makes it the switch
+for the EOD import: a pair that is not listed here is never stored, so
+registering one is how you start collecting it. The reference is `RESTRICT`, so
+unregistering a pair that still has candles returns `409 Conflict` rather than
+quietly taking its price history with it — delete the candles first if that is
+really what you want. The foreign keys onto `currency` are `RESTRICT` for the
+same reason.
 
 ### Currencies
 
