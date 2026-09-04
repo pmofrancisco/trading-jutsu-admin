@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { MarketDataModule } from './market-data/market-data.module';
+import { CurrencyModule } from './currency/currency.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { MarketDataModule } from './market-data/market-data.module';
         : false,
     }),
     MarketDataModule,
+    CurrencyModule,
   ],
 })
 export class AppModule {}

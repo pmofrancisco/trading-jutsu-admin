@@ -1,14 +1,15 @@
 # forex-service
 
-NestJS service exposing CRUD over foreign exchange market data (OHLC candles),
-backed by Postgres via TypeORM.
+NestJS service exposing CRUD over foreign exchange market data (OHLC candles)
+and the ISO 4217 currencies those pairs are built from, backed by Postgres via
+TypeORM.
 
 ## Setup
 
 ```bash
 pnpm install
 cp .env.example .env   # then set DATABASE_URL and MASSIVE_API_KEY
-pnpm migration:run     # creates the market_data table and its indexes
+pnpm migration:run     # creates the market_data and currency tables
 ```
 
 `DATABASE_URL` is required, as are `MASSIVE_BASE_URL` and `MASSIVE_API_KEY` for
@@ -26,7 +27,9 @@ Swagger UI is served at `http://localhost:3004/docs`.
 
 ## API
 
-All routes live under `/market-data`.
+### Market data
+
+These routes live under `/market-data`.
 
 | Method   | Path                       | Description                        |
 | -------- | -------------------------- | ---------------------------------- |
@@ -127,6 +130,54 @@ Massive returns `404`.
 Note that `numeric(18,6)` limits how much of an exotic pair survives: `C:LBPUSD`
 around `1.1×10^-5` keeps two significant digits. Majors and ordinary crosses are
 unaffected.
+
+### Currencies
+
+`/currencies` is a reference table of ISO 4217 codes — the halves a
+`market_data.symbol` pair is built from, so `EURUSD` is `EUR` against `USD` and
+`XAUUSD` gold against the dollar. Metals live here too: `XAU` is the ISO code
+for a troy ounce of gold, so it needs no table of its own.
+
+| Method   | Path                      | Description                           |
+| -------- | ------------------------- | ------------------------------------- |
+| `POST`   | `/currencies`             | Create a currency                     |
+| `POST`   | `/currencies/bulk-upsert` | Insert or update many currencies      |
+| `GET`    | `/currencies`             | List currencies (filtered, paginated) |
+| `GET`    | `/currencies/:code`       | Fetch a currency by code              |
+| `PATCH`  | `/currencies/:code`       | Partially update a currency           |
+| `DELETE` | `/currencies/:code`       | Delete a currency                     |
+
+A currency is `{ code, name }` — `{ "code": "USD", "name": "US Dollar" }`,
+`{ "code": "XAU", "name": "Gold" }` — plus `createdAt` and `updatedAt`.
+
+`code` is the primary key rather than a surrogate id: it is assigned upstream,
+immutable, and what a caller already has in hand, so `GET /currencies/USD`
+needs no lookup first. Codes are normalized to upper case on the way in, on the
+path and in a query string alike, so `/currencies/usd` resolves; anything that
+is not three letters is a `400`. Creating a code that exists returns `409
+Conflict`, and an unknown code `404 Not Found`.
+
+`code` is deliberately absent from the `PATCH` body — it is the row's identity,
+not one of its fields, so renaming a currency changes `name` and re-coding one
+means delete and create.
+
+List query parameters: `code` (exact), `search` (case-insensitive substring of
+the name, with `%` and `_` matched literally), `limit` (1–1000, default **500**)
+and `offset` (default 0). Results are ordered by `code` ascending. The default
+page is deliberately larger than market data's 100: ISO 4217 is about 180 codes,
+so one page holds the whole standard and a caller filling a dropdown cannot
+silently miss any.
+
+`POST /currencies/bulk-upsert` takes `{ "currencies": [ ... ] }` and returns
+`{ "upserted": n }`, matching on `code`. It is how you seed the standard without
+180 requests. A batch is capped at 1000 entries, which keeps it to one statement
+well inside the Postgres bound-parameter ceiling — so unlike a market-data
+upsert it needs no chunking. Repeating a code inside one request is a `400`, for
+the same reason it is there: Postgres cannot apply two `ON CONFLICT` updates to
+one row.
+
+ISO 4217 changes a few times a decade, so there is no import route for it the
+way there is for EOD bars — seed it once through `bulk-upsert`.
 
 ## Migrations
 
