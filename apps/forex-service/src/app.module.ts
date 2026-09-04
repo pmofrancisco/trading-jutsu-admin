@@ -4,6 +4,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { SnakeNamingStrategy } from './snake-naming.strategy';
 import { MarketDataModule } from './market-data/market-data.module';
 import { CurrencyModule } from './currency/currency.module';
+import { CurrencyPairModule } from './currency-pair/currency-pair.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { CurrencyModule } from './currency/currency.module';
     }),
     MarketDataModule,
     CurrencyModule,
+    CurrencyPairModule,
   ],
 })
 export class AppModule {}
