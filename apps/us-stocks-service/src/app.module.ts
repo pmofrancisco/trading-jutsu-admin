@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { SnakeNamingStrategy } from './snake-naming.strategy';
 import { MarketDataModule } from './market-data/market-data.module';
+import { ExcludedSymbolModule } from './excluded-symbol/excluded-symbol.module';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { MarketDataModule } from './market-data/market-data.module';
         : false,
     }),
     MarketDataModule,
+    ExcludedSymbolModule,
   ],
 })
 export class AppModule {}

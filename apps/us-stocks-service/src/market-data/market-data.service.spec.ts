@@ -7,10 +7,11 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { QueryFailedError, Repository } from 'typeorm';
+import { QueryFailedError } from 'typeorm';
 import { MarketDataService } from './market-data.service';
 import { MarketData } from './market-data.entity';
 import { CreateMarketDataDto } from './dto/create-market-data.dto';
+import { ExcludedSymbolService } from '../excluded-symbol/excluded-symbol.service';
 
 const candle: CreateMarketDataDto = {
   symbol: 'AAPL',
@@ -47,11 +48,34 @@ function uniqueViolation(): QueryFailedError {
 
 describe('MarketDataService', () => {
   let service: MarketDataService;
-  let repository: jest.Mocked<Repository<MarketData>>;
+  // Typed as plain mocks rather than `jest.Mocked<Repository<…>>` so an
+  // assertion can name one without passing an unbound method around, the same
+  // reason the query builder below is a `Record<string, jest.Mock>`.
+  let repository: {
+    create: jest.Mock;
+    save: jest.Mock;
+    findOneBy: jest.Mock;
+    delete: jest.Mock;
+    createQueryBuilder: jest.Mock;
+    manager: { transaction: jest.Mock };
+  };
   let queryBuilder: Record<string, jest.Mock>;
   let entityManager: { upsert: jest.Mock };
   let transaction: jest.Mock;
   let fetchMock: jest.Mock;
+  let excludedSymbolService: {
+    findAllSymbols: jest.Mock;
+    isExcluded: jest.Mock;
+  };
+
+  // The excluded list is empty unless a test says otherwise, so every existing
+  // expectation reads as it did before the list existed.
+  const exclude = (...symbols: string[]): void => {
+    excludedSymbolService.findAllSymbols.mockResolvedValue(new Set(symbols));
+    excludedSymbolService.isExcluded.mockImplementation((symbol: string) =>
+      Promise.resolve(symbols.includes(symbol.trim().toUpperCase())),
+    );
+  };
 
   beforeEach(async () => {
     queryBuilder = {
@@ -65,24 +89,31 @@ describe('MarketDataService', () => {
     fetchMock = jest.fn();
     global.fetch = fetchMock;
 
+    excludedSymbolService = {
+      findAllSymbols: jest.fn().mockResolvedValue(new Set<string>()),
+      isExcluded: jest.fn().mockResolvedValue(false),
+    };
+
     entityManager = { upsert: jest.fn().mockResolvedValue(undefined) };
     transaction = jest.fn((run: (manager: unknown) => Promise<unknown>) =>
       run(entityManager),
     );
+
+    repository = {
+      create: jest.fn((dto: CreateMarketDataDto) => dto as MarketData),
+      save: jest.fn(),
+      findOneBy: jest.fn(),
+      delete: jest.fn(),
+      createQueryBuilder: jest.fn(() => queryBuilder),
+      manager: { transaction },
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         MarketDataService,
         {
           provide: getRepositoryToken(MarketData),
-          useValue: {
-            create: jest.fn((dto: CreateMarketDataDto) => dto as MarketData),
-            save: jest.fn(),
-            findOneBy: jest.fn(),
-            delete: jest.fn(),
-            createQueryBuilder: jest.fn(() => queryBuilder),
-            manager: { transaction },
-          },
+          useValue: repository,
         },
         {
           provide: ConfigService,
@@ -90,11 +121,14 @@ describe('MarketDataService', () => {
             getOrThrow: jest.fn((key: string) => MASSIVE_CONFIG[key]),
           },
         },
+        {
+          provide: ExcludedSymbolService,
+          useValue: excludedSymbolService,
+        },
       ],
     }).compile();
 
     service = module.get(MarketDataService);
-    repository = module.get(getRepositoryToken(MarketData));
   });
 
   describe('create', () => {
@@ -118,6 +152,23 @@ describe('MarketDataService', () => {
       repository.save.mockRejectedValue(error);
 
       await expect(service.create(candle)).rejects.toBe(error);
+    });
+
+    it('rejects an excluded symbol', async () => {
+      exclude('AAPL');
+
+      await expect(service.create(candle)).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(repository.save).not.toHaveBeenCalled();
+    });
+
+    it('rejects an excluded symbol whatever case it is sent in', async () => {
+      exclude('AAPL');
+
+      await expect(
+        service.create({ ...candle, symbol: 'aapl' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
     });
   });
 
@@ -250,6 +301,23 @@ describe('MarketDataService', () => {
           { ...candle, timestamp: new Date('2026-08-05T00:00:00.000Z') },
         ]),
       ).resolves.toEqual({ upserted: 2 });
+    });
+
+    it('rejects a batch naming an excluded symbol', async () => {
+      exclude('MSFT');
+
+      await expect(
+        service.bulkUpsert([candle, { ...candle, symbol: 'MSFT' }]),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(entityManager.upsert).not.toHaveBeenCalled();
+    });
+
+    it('names the excluded symbol in the error', async () => {
+      exclude('MSFT');
+
+      await expect(
+        service.bulkUpsert([{ ...candle, symbol: 'MSFT' }]),
+      ).rejects.toThrow('MSFT');
     });
   });
 
@@ -391,6 +459,70 @@ describe('MarketDataService', () => {
         BadGatewayException,
       );
     });
+
+    it('drops an excluded symbol and counts it apart from skipped', async () => {
+      exclude('ZVZZT');
+      respondWith([bar, { ...bar, T: 'ZVZZT' }]);
+
+      await expect(service.importEod('2026-08-21')).resolves.toMatchObject({
+        imported: 1,
+        excluded: 1,
+        skipped: 0,
+      });
+      expect(upsertedCandles().map((c) => c.symbol)).toEqual(['AAPL']);
+    });
+
+    it('counts an unusable bar as skipped, not excluded', async () => {
+      respondWith([bar, { ...bar, T: 'BADD', c: -1 }]);
+
+      await expect(service.importEod('2026-08-21')).resolves.toMatchObject({
+        imported: 1,
+        excluded: 0,
+        skipped: 1,
+      });
+    });
+
+    // An excluded symbol is dropped for that reason whatever else is wrong
+    // with the bar, so the two counts never depend on which check runs first.
+    it('counts an excluded symbol as excluded even when its bar is unusable', async () => {
+      exclude('ZVZZT');
+      respondWith([{ ...bar, T: 'ZVZZT', c: -1 }]);
+
+      await expect(service.importEod('2026-08-21')).resolves.toMatchObject({
+        imported: 0,
+        excluded: 1,
+        skipped: 0,
+      });
+    });
+
+    it('matches an excluded symbol case-insensitively', async () => {
+      exclude('ZVZZT');
+      respondWith([{ ...bar, T: 'zvzzt' }]);
+
+      await expect(service.importEod('2026-08-21')).resolves.toMatchObject({
+        excluded: 1,
+      });
+    });
+
+    // The list runs to five figures, so reading it per bar -- or a second time
+    // for the upsert -- is the one way this filter could cost anything.
+    it('reads the exclusion list once per import', async () => {
+      exclude('ZVZZT');
+      respondWith([bar, { ...bar, T: 'MSFT' }, { ...bar, T: 'ZVZZT' }]);
+
+      await service.importEod('2026-08-21');
+
+      expect(excludedSymbolService.findAllSymbols).toHaveBeenCalledTimes(1);
+    });
+
+    it('still upserts when nothing is excluded', async () => {
+      respondWith([bar]);
+
+      await expect(service.importEod('2026-08-21')).resolves.toMatchObject({
+        imported: 1,
+        excluded: 0,
+      });
+    });
   });
 
   describe('findOne', () => {
@@ -414,6 +546,47 @@ describe('MarketDataService', () => {
       await expect(
         service.update('1', { close: 230.1 }),
       ).resolves.toMatchObject({ id: '1', close: 230.1, open: 225.5 });
+    });
+
+    it('rejects a patch that names an excluded symbol', async () => {
+      exclude('ZVZZT');
+
+      await expect(
+        service.update('1', { symbol: 'ZVZZT' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(repository.save).not.toHaveBeenCalled();
+    });
+
+    // A candle stored before its symbol was excluded is still editable: the
+    // exclusion governs what is written, not what is already there.
+    it('allows a patch that does not name a symbol', async () => {
+      exclude('AAPL');
+      const stored = { id: '1', ...candle } as MarketData;
+      repository.findOneBy.mockResolvedValue(stored);
+      repository.save.mockImplementation((entity) =>
+        Promise.resolve(entity as MarketData),
+      );
+
+      await expect(
+        service.update('1', { close: 230.1 }),
+      ).resolves.toMatchObject({ close: 230.1 });
+    });
+
+    // `PartialType` marks every field `@IsOptional()`, which class-validator
+    // honours for an explicit `null` -- so a null symbol reaches the service
+    // typed as a string. The exclusion check must not be what crashes on it.
+    it('does not crash on a patch whose symbol is null', async () => {
+      exclude('ZVZZT');
+      const stored = { id: '1', ...candle } as MarketData;
+      repository.findOneBy.mockResolvedValue(stored);
+      repository.save.mockImplementation((entity) =>
+        Promise.resolve(entity as MarketData),
+      );
+
+      await expect(
+        service.update('1', { symbol: null as unknown as string }),
+      ).resolves.toBeDefined();
+      expect(excludedSymbolService.isExcluded).not.toHaveBeenCalled();
     });
 
     it('throws when the candle does not exist', async () => {
