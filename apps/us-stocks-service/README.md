@@ -28,7 +28,7 @@ Swagger UI is served at `http://localhost:3003/docs`.
 
 ## API
 
-All routes live under `/market-data`.
+Routes live under `/market-data` and `/excluded-symbols`.
 
 | Method   | Path                        | Description                        |
 | -------- | --------------------------- | ---------------------------------- |
@@ -69,8 +69,8 @@ Repeating the same `(symbol, timestamp)` twice *within one request* returns
 (defaulting to the current date), fetches that day's grouped daily bars from
 `GET {MASSIVE_BASE_URL}/v2/aggs/grouped/locale/us/market/stocks/{date}?adjusted=true`,
 and feeds them through the same bulk upsert, so re-running it for a date is a
-no-op. It returns `{ date, sourceUrl, imported, skipped }` — `sourceUrl` omits
-the API key.
+no-op. It returns `{ date, sourceUrl, imported, skipped, excluded }` —
+`sourceUrl` omits the API key.
 
 Each upstream bar maps as `T`→`symbol`, `o`/`h`/`l`/`c`→OHLC, `v`→`volume`, and
 `t` (Unix milliseconds, the start of the aggregate window) →`timestamp`. Massive
@@ -81,6 +81,44 @@ Bars that cannot be stored — missing or non-positive prices, a price at or abo
 `10^8`, a symbol over 20 characters — are skipped and counted in `skipped`
 rather than failing the day's import. An unreachable or erroring upstream
 returns `502`, and a `404` from Massive returns `404`.
+
+Bars naming a symbol in `excluded_symbol` are dropped and counted in
+`excluded`, kept apart from `skipped` because it means something different: the
+bar was fine, the symbol is simply one this service does not store. The list is
+read once per import, not once per bar, and the batch is filtered before it
+reaches the database — so excluding most of the feed makes an import *faster*,
+since the upsert is what the day's work actually costs.
+
+### Excluded symbols
+
+| Method   | Path                            | Description                       |
+| -------- | ------------------------------- | --------------------------------- |
+| `POST`   | `/excluded-symbols`             | Exclude a symbol                  |
+| `POST`   | `/excluded-symbols/bulk-upsert` | Exclude many symbols              |
+| `GET`    | `/excluded-symbols`             | List exclusions (paginated)       |
+| `GET`    | `/excluded-symbols/:symbol`     | Fetch one exclusion               |
+| `DELETE` | `/excluded-symbols/:symbol`     | Stop excluding a symbol           |
+
+The tickers this service refuses to store: `{ symbol, reason? }`, where
+`reason` is free text up to 200 characters. Symbols are stored and compared
+upper-cased, so `aapl` and `AAPL` are the same exclusion — a denylist a change
+of case slips past is not one. List query parameters are `symbol`, `limit`
+(1–1000, default 100) and `offset` (default 0), ordered by `symbol` ascending.
+
+The bulk upsert takes up to 20000 symbols in one request and is idempotent —
+re-sending a symbol with a new reason rewrites it — so a regenerated exclusion
+list can be posted whole. It runs in a single transaction, chunked at 1000 rows.
+Repeating a symbol *within one request* returns `400` naming it.
+
+This is a denylist, not the allowlist `forex-service` keeps in `currency_pair`,
+so it is deliberately **not** a foreign key on `market_data.symbol`: Postgres
+can require a referenced row to exist, not require one to be absent. The rule
+is enforced in `MarketDataService` instead, on every write path — `POST
+/market-data`, the bulk upsert, and a `PATCH` that names a symbol all return
+`400` for an excluded ticker.
+
+Excluding a symbol says nothing about the candles already stored for it. Past
+rows stay, and stay editable; delete them separately if they are not wanted.
 
 ## Migrations
 

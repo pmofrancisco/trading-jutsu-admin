@@ -12,6 +12,8 @@ import { MarketData } from './market-data.entity';
 import { CreateMarketDataDto } from './dto/create-market-data.dto';
 import { UpdateMarketDataDto } from './dto/update-market-data.dto';
 import { QueryMarketDataDto } from './dto/query-market-data.dto';
+import { ExcludedSymbolService } from '../excluded-symbol/excluded-symbol.service';
+import { normalizeSymbolString } from '../excluded-symbol/excluded-symbol.constants';
 
 const POSTGRES_UNIQUE_VIOLATION = '23505';
 
@@ -40,6 +42,12 @@ export interface ImportEodResult {
   sourceUrl: string;
   imported: number;
   skipped: number;
+  // Bars for a well-formed ticker listed in `excluded_symbol`. Counted apart
+  // from `skipped` because it means something different: the bar was fine, the
+  // symbol is simply one this service does not store. An exclusion list runs
+  // to five figures against a feed of twelve thousand bars, so folding the two
+  // together would bury the bars that were genuinely unusable.
+  excluded: number;
 }
 
 // A grouped daily bar as returned by the Massive API. Every field is optional
@@ -89,15 +97,29 @@ function isValidPrice(value: unknown): value is number {
   );
 }
 
+// The bar's ticker, or null when it carries nothing `market_data.symbol` could
+// hold. Split out of `toCandle` so an import can test the symbol against the
+// exclusion list before spending anything on parsing the rest of the bar.
+function toSymbol(value: unknown): string | null {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > SYMBOL_MAX_LENGTH
+  ) {
+    return null;
+  }
+  return value;
+}
+
 // Maps one upstream bar onto a candle, or returns null when the bar cannot be
 // stored -- an unusable ticker is dropped rather than failing the whole import.
-function toCandle(bar: MassiveEodBar): CreateMarketDataDto | null {
-  const { T: symbol, o: open, h: high, l: low, c: close, v: volume, t } = bar;
+function toCandle(
+  symbol: string,
+  bar: MassiveEodBar,
+): CreateMarketDataDto | null {
+  const { o: open, h: high, l: low, c: close, v: volume, t } = bar;
 
   if (
-    typeof symbol !== 'string' ||
-    symbol.length === 0 ||
-    symbol.length > SYMBOL_MAX_LENGTH ||
     typeof t !== 'number' ||
     !Number.isFinite(t) ||
     typeof volume !== 'number' ||
@@ -141,6 +163,24 @@ function assertNoDuplicateKeys(candles: CreateMarketDataDto[]): void {
   }
 }
 
+// A denylist cannot be a foreign key: Postgres can require a referenced row to
+// exist, not require one to be absent. So nothing in the database stops an
+// excluded symbol from being written, and this is what enforces it instead.
+// Compared upper-cased, because `market_data.symbol` is stored as the caller
+// sent it -- an exclusion `aapl` slipped past would not be an exclusion.
+function assertNoExcludedSymbols(
+  candles: CreateMarketDataDto[],
+  excludedSymbols: Set<string>,
+): void {
+  for (const candle of candles) {
+    if (excludedSymbols.has(normalizeSymbolString(candle.symbol))) {
+      throw new BadRequestException(
+        `Symbol "${candle.symbol}" is excluded and cannot be stored`,
+      );
+    }
+  }
+}
+
 interface PostgresDriverError {
   code: string;
 }
@@ -159,9 +199,11 @@ export class MarketDataService {
     @InjectRepository(MarketData)
     private readonly marketDataRepository: Repository<MarketData>,
     private readonly configService: ConfigService,
+    private readonly excludedSymbolService: ExcludedSymbolService,
   ) {}
 
-  create(dto: CreateMarketDataDto): Promise<MarketData> {
+  async create(dto: CreateMarketDataDto): Promise<MarketData> {
+    await this.assertNotExcluded(dto.symbol);
     return this.saveOrThrowConflict(this.marketDataRepository.create(dto));
   }
 
@@ -194,6 +236,16 @@ export class MarketDataService {
   }
 
   async update(id: string, dto: UpdateMarketDataDto): Promise<MarketData> {
+    // Only when the patch names a symbol: re-checking the stored one would
+    // make an unrelated edit fail on a candle that predates the exclusion.
+    // Narrowed on `typeof` rather than `!== undefined` because `PartialType`
+    // marks every inherited field `@IsOptional()`, which class-validator honours
+    // for an explicit `null` too -- so `{ "symbol": null }` reaches here typed
+    // as a string but holding null. It is not this check's business to reject:
+    // the column is NOT NULL and says so for every field alike.
+    if (typeof dto.symbol === 'string') {
+      await this.assertNotExcluded(dto.symbol);
+    }
     const marketData = await this.findOne(id);
     Object.assign(marketData, dto);
     return this.saveOrThrowConflict(marketData);
@@ -207,7 +259,21 @@ export class MarketDataService {
   }
 
   async bulkUpsert(candles: CreateMarketDataDto[]): Promise<BulkUpsertResult> {
+    return this.upsertCandles(
+      candles,
+      await this.excludedSymbolService.findAllSymbols(),
+    );
+  }
+
+  // The shared write path. Takes the exclusion set rather than reading it, so
+  // an import that has already filtered against it does not go back for a
+  // second copy of a five-figure list.
+  private async upsertCandles(
+    candles: CreateMarketDataDto[],
+    excludedSymbols: Set<string>,
+  ): Promise<BulkUpsertResult> {
     assertNoDuplicateKeys(candles);
+    assertNoExcludedSymbols(candles, excludedSymbols);
 
     // One transaction across every chunk, so a failure part way through a
     // large batch leaves no partially ingested session behind.
@@ -271,20 +337,54 @@ export class MarketDataService {
       );
     }
 
-    const candles = payload.results
-      .map(toCandle)
-      .filter((candle): candle is CreateMarketDataDto => candle !== null);
+    // The feed carries every symbol Massive quotes; this list is the ones not
+    // worth storing. Read once per import rather than once per bar, and the
+    // batch is filtered before it reaches the database -- there is no
+    // constraint to reject an excluded symbol on the way in.
+    const excludedSymbols = await this.excludedSymbolService.findAllSymbols();
+
+    const candles: CreateMarketDataDto[] = [];
+    let excluded = 0;
+
+    for (const bar of payload.results) {
+      const symbol = toSymbol(bar.T);
+      if (symbol === null) {
+        continue;
+      }
+      // Checked before the bar is parsed: an excluded symbol is dropped for
+      // that reason whatever else is wrong with it, which keeps the counts
+      // from depending on the order the two checks happen to run in.
+      if (excludedSymbols.has(normalizeSymbolString(symbol))) {
+        excluded += 1;
+        continue;
+      }
+      const candle = toCandle(symbol, bar);
+      if (candle !== null) {
+        candles.push(candle);
+      }
+    }
 
     if (candles.length > 0) {
-      await this.bulkUpsert(candles);
+      await this.upsertCandles(candles, excludedSymbols);
     }
 
     return {
       date: tradingDate,
       sourceUrl,
       imported: candles.length,
-      skipped: payload.results.length - candles.length,
+      skipped: payload.results.length - candles.length - excluded,
+      excluded,
     };
+  }
+
+  // Single-symbol guard for the routes that write one candle. A key lookup
+  // rather than the whole set, which the write paths have no other use for.
+  private async assertNotExcluded(symbol: string): Promise<void> {
+    if (await this.excludedSymbolService.isExcluded(symbol)) {
+      throw new BadRequestException(
+        `Symbol "${symbol}" is excluded and cannot be stored`,
+      );
+    }
   }
 
   private async saveOrThrowConflict(
