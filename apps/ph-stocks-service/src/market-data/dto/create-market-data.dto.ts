@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import {
   IsDate,
   IsNumber,
@@ -8,11 +8,17 @@ import {
   Min,
   MaxLength,
 } from 'class-validator';
+import { SYMBOL_MAX_LENGTH, normalizeSymbol } from '../market-data.constants';
 
 export class CreateMarketDataDto {
-  @ApiProperty({ example: 'JFC', maxLength: 20 })
+  @ApiProperty({
+    example: 'JFC',
+    maxLength: SYMBOL_MAX_LENGTH,
+    description: 'Ticker or index symbol; normalized to upper case',
+  })
+  @Transform(({ value }) => normalizeSymbol(value))
   @IsString()
-  @MaxLength(20)
+  @MaxLength(SYMBOL_MAX_LENGTH)
   symbol: string;
 
   @ApiProperty({ example: '2026-08-04T00:00:00.000Z' })

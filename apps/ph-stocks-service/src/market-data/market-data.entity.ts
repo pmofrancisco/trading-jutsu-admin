@@ -6,6 +6,7 @@ import {
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
+import { SYMBOL_MAX_LENGTH } from './market-data.constants';
 
 const numericTransformer = {
   to: (value?: number) => value,
@@ -22,7 +23,7 @@ export class MarketData {
   @PrimaryGeneratedColumn('increment', { type: 'bigint' })
   id: string;
 
-  @Column({ type: 'varchar', length: 20 })
+  @Column({ type: 'varchar', length: SYMBOL_MAX_LENGTH })
   symbol: string;
 
   @Column({ type: 'timestamptz' })

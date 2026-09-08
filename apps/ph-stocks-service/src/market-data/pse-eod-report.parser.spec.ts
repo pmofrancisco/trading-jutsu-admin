@@ -3,13 +3,22 @@ import { join } from 'path';
 import { parseEodLines } from './pse-eod-report.parser';
 
 // Real lines extracted (via the same positional-text logic as extractLines)
-// from PSE's Daily Quotation Report PDF for August 07, 2026.
-const lines = JSON.parse(
-  readFileSync(
-    join(__dirname, '__fixtures__', 'pse-eod-2026-08-07-lines.json'),
-    'utf-8',
-  ),
-) as string[];
+// from PSE's Daily Quotation Report PDFs.
+function loadFixture(date: string): string[] {
+  return JSON.parse(
+    readFileSync(
+      join(__dirname, '__fixtures__', `pse-eod-${date}-lines.json`),
+      'utf-8',
+    ),
+  ) as string[];
+}
+
+// August 07, 2026: the report still labelled the index row `PSEI`.
+const lines = loadFixture('2026-08-07');
+
+// September 04, 2026: from the August 14, 2026 report on, PSE labels the same
+// row `PSEi`, which the case-sensitive parser silently dropped.
+const relabelledLines = loadFixture('2026-09-04');
 
 describe('parseEodLines', () => {
   it('parses regular stock rows', () => {
@@ -90,6 +99,49 @@ describe('parseEodLines', () => {
       volume: null,
       value: null,
     });
+  });
+
+  it('parses the PSEI row from reports that label it "PSEi"', () => {
+    const rows = parseEodLines(relabelledLines);
+    const psei = rows.find((row) => row.symbol === 'PSEI');
+
+    expect(psei).toEqual({
+      symbol: 'PSEI',
+      open: 6068.48,
+      high: 6094.23,
+      low: 6057.75,
+      close: 6090.6,
+      volume: null,
+      value: null,
+    });
+  });
+
+  it('still parses stock and sectoral rows from the relabelled report', () => {
+    const rows = parseEodLines(relabelledLines);
+    const bySymbol = Object.fromEntries(rows.map((row) => [row.symbol, row]));
+
+    expect(bySymbol.SCC).toMatchObject({ open: 17.22, close: 17.64 });
+    expect(Object.keys(bySymbol)).toEqual(
+      expect.arrayContaining(['FINA', 'INDU', 'HOLD', 'PROP', 'SERV', 'MINI']),
+    );
+  });
+
+  it('upper-cases parsed stock symbols', () => {
+    const rows = parseEodLines([
+      'JOLLIBEE FOODS jfc 250.0 251.0 250.5 255.0 248.2 252.8 1,250,000 315,000,000 -',
+    ]);
+
+    expect(rows).toEqual([
+      {
+        symbol: 'JFC',
+        open: 250.5,
+        high: 255,
+        low: 248.2,
+        close: 252.8,
+        volume: 1_250_000,
+        value: 315_000_000,
+      },
+    ]);
   });
 
   it('stops parsing at the dollar-denominated securities section', () => {
