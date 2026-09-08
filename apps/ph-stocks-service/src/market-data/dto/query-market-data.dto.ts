@@ -1,10 +1,15 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { IsDate, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+import { normalizeSymbol } from '../market-data.constants';
 
 export class QueryMarketDataDto {
-  @ApiPropertyOptional({ example: 'JFC' })
+  @ApiPropertyOptional({
+    example: 'JFC',
+    description: 'Ticker or index symbol; normalized to upper case',
+  })
   @IsOptional()
+  @Transform(({ value }) => normalizeSymbol(value))
   @IsString()
   symbol?: string;
 

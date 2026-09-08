@@ -1,3 +1,5 @@
+import { normalizeSymbolString } from './market-data.constants';
+
 export interface PseEodRow {
   symbol: string;
   open: number | null;
@@ -20,8 +22,14 @@ const NUMBER_OR_DASH = String.raw`-|\(?[\d,]+(?:\.\d+)?\)?`;
 
 // A data row looks like:
 // "<Issue Name...> <SYMBOL> <Bid> <Ask> <Open> <High> <Low> <Close> <Volume> <Value> <NetForeign>"
+//
+// The symbol is matched case-insensitively and upper-cased on the way out: the
+// report's casing is PSE's to change (and it has), so treat it as presentation
+// rather than as part of the identifier. The nine trailing number columns and
+// the `$` pin the capture to the token just before them, so widening the
+// character class cannot pull a word out of the issue name.
 const ROW_REGEX = new RegExp(
-  `^.+?\\s+([A-Z][A-Z0-9]{0,19})` +
+  `^.+?\\s+([A-Za-z][A-Za-z0-9]{0,19})` +
     Array.from({ length: 9 }, () => `\\s+(${NUMBER_OR_DASH})`).join('') +
     '$',
 );
@@ -50,11 +58,16 @@ const SECTOR_ROW_REGEX = new RegExp(
 );
 
 // The PSEI row has no Volume/Value columns:
-// "PSEI <Open> <High> <Low> <Close> <%Change> <Pt.Change>"
+// "PSEi <Open> <High> <Low> <Close> <%Change> <Pt.Change>"
+//
+// Matched case-insensitively because PSE writes the label as `PSEI` up to the
+// August 13, 2026 report and as `PSEi` from August 14 on. The row is stored
+// under `PSEI` either way -- it is the same index.
 const PSEI_ROW_REGEX = new RegExp(
   `^PSEI` +
     Array.from({ length: 6 }, () => `\\s+(${NUMBER_OR_DASH})`).join('') +
     '$',
+  'i',
 );
 
 function parseNumberOrNull(token: string): number | null {
@@ -176,7 +189,7 @@ export function parseEodLines(lines: string[]): PseEodRow[] {
     }
     const [, symbol, , , open, high, low, close, volume, value] = match;
     rows.push({
-      symbol,
+      symbol: normalizeSymbolString(symbol),
       open: parseNumberOrNull(open),
       high: parseNumberOrNull(high),
       low: parseNumberOrNull(low),
